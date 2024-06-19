@@ -18,6 +18,11 @@ from torch import optim
 from torch.utils.data import DataLoader
 from . import NISQA_lib as NL
         
+
+def constraint_loss(pred1, pred2, epsilon=0.05):
+    return torch.mean(torch.max(torch.tensor(0.0), pred1 - pred2 + epsilon)) 
+    
+
 class nisqaModel(object):
     '''
     nisqaModel: Main class that loads the model and the datasets. Contains
@@ -28,6 +33,10 @@ class nisqaModel(object):
         
         if 'mode' not in self.args:
             self.args['mode'] = 'main'
+
+        # args for semi phase
+        self.alpha = 0.9
+        self.semi_data_path = f"./data/nisqa_semi"
             
         self.runinfos = {}       
         self._getDevice()
@@ -79,6 +88,189 @@ class nisqaModel(object):
             
         print(self.ds_val.df.to_string(index=False))
         return self.ds_val.df
+    
+    def semi(self):
+        '''
+        Trains speech quality model.
+        '''
+        # Initialize  -------------------------------------------------------------
+        if self.args['tr_parallel']:
+            self.model = nn.DataParallel(self.model)
+        self.model.to(self.dev)
+
+        # Runname and savepath  ---------------------------------------------------
+        self.runname = self._makeRunnameAndWriteYAML()
+
+        # Optimizer  -------------------------------------------------------------
+        opt = optim.Adam(self.model.parameters(), lr=self.args['tr_lr'])        
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                opt,
+                'min',
+                verbose=True,
+                threshold=0.003,
+                patience=self.args['tr_lr_patience'])
+        earlyStp = NL.earlyStopper(self.args['tr_early_stop'])      
+        
+        biasLoss = NL.biasLoss(
+            self.ds_train.df.db, 
+            anchor_db=self.args['tr_bias_anchor_db'], 
+            mapping=self.args['tr_bias_mapping'], 
+            min_r=self.args['tr_bias_min_r'],
+            do_print=(self.args['tr_verbose']>0),
+            )
+        
+        # Dataloader    -----------------------------------------------------------
+        dl_train = DataLoader(
+            self.ds_train,
+            batch_size=self.args['tr_bs'],
+            shuffle=True,
+            drop_last=False,
+            pin_memory=False,
+            num_workers=self.args['tr_num_workers'])
+
+        dl_semi = DataLoader(
+            self.ds_semi,
+            batch_size=self.args['tr_bs'],
+            shuffle=True,
+            drop_last=False,
+            pin_memory=False,
+            num_workers=self.args['tr_num_workers'])
+
+        dl_semi_iter = iter(dl_semi)
+        
+        # Start training loop   ---------------------------------------------------
+        print('--> start training')
+        for epoch in range(self.args['tr_epochs']):
+
+            tic_epoch = time.time()
+            batch_cnt = 0
+            loss = 0.0
+            y_train = self.ds_train.df[self.args['csv_mos_train']].to_numpy().reshape(-1)
+            y_train_hat = np.zeros((len(self.ds_train), 1))
+            self.model.train()
+            
+            for xb_spec, yb_mos, (idx, n_wins) in tqdm(dl_train):
+
+                # Estimate batch ---------------------------------------------------
+                xb_spec = xb_spec.to(self.dev)
+                yb_mos = yb_mos.to(self.dev)
+                n_wins = n_wins.to(self.dev)
+
+                # Forward pass ----------------------------------------------------
+                yb_mos_hat = self.model(xb_spec, n_wins)
+                y_train_hat[idx] = yb_mos_hat.detach().cpu().numpy()
+
+                # Loss ------------------------------------------------------------       
+                lossb = biasLoss.get_loss(yb_mos, yb_mos_hat, idx)
+
+                # Semi ------------------------------------------------------------       
+                try:
+                    [clean_semi, noisy_semi, enhanced_semi], score_semi, n_wins_semi = next(dl_semi_iter)
+                except StopIteration:
+                    del dl_semi_iter
+                    dl_semi_iter = iter(dl_semi)
+                    [clean_semi, noisy_semi, enhanced_semi], score_semi, n_wins_semi = next(dl_semi_iter)
+
+                # clean_score, noisy_score, enhanced_score = score_semi
+                n_wins_clean, n_wins_noisy, n_wins_enhanced = n_wins_semi
+                
+                # label semi
+                # label_semi = noisy_score/enhanced_score
+                # label_semi = label_semi.to(self.dev)
+                
+                # forward semi
+                noisy_semi = noisy_semi.to(self.dev)
+                enhanced_semi = enhanced_semi.to(self.dev)
+                n_wins_noisy = n_wins_noisy.to(self.dev)
+                n_wins_enhanced = n_wins_enhanced.to(self.dev)
+
+                noisy_mos = self.model(noisy_semi, n_wins_noisy)
+                enhanced_mos = self.model(enhanced_semi, n_wins_enhanced)
+
+                # output semi
+                # output_semi = noisy_mos/enhanced_mos
+
+                # Loss semi
+                # print(noisy_mos)
+                # print(enhanced_mos)
+                # print(noisy_score)
+                # print(enhanced_score)
+
+                loss_semi = constraint_loss(noisy_mos, enhanced_mos)
+                    
+                # Backprop  -------------------------------------------------------
+                loss_total = self.alpha * lossb + (1-self.alpha) * loss_semi
+                loss_total.backward()
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+
+                # Update total loss -----------------------------------------------
+                loss += loss_total.item()
+                batch_cnt += 1
+
+            loss = loss/batch_cnt
+            
+            biasLoss.update_bias(y_train, y_train_hat)
+
+            # Evaluate   -----------------------------------------------------------
+            if self.args['tr_verbose']>0:
+                print('\n<---- Training ---->')
+            self.ds_train.df['mos_pred'] = y_train_hat
+            db_results_train, r_train = NL.eval_results(
+                self.ds_train.df, 
+                dcon=self.ds_train.df_con, 
+                target_mos=self.args['csv_mos_train'],
+                target_ci=self.args['csv_mos_train'] + '_ci',
+                pred='mos_pred',
+                mapping = 'first_order',
+                do_print=(self.args['tr_verbose']>0)
+                )
+            
+            if self.args['tr_verbose']>0:
+                print('<---- Validation ---->')
+            NL.predict_mos(self.model, self.ds_val, self.args['tr_bs_val'], self.dev, num_workers=self.args['tr_num_workers'])
+            db_results, r_val = NL.eval_results(
+                self.ds_val.df, 
+                dcon=self.ds_val.df_con, 
+                target_mos=self.args['csv_mos_val'],
+                target_ci=self.args['csv_mos_val'] + '_ci',
+                pred='mos_pred',
+                mapping = 'first_order',
+                do_print=(self.args['tr_verbose']>0)
+                )            
+            
+            r = {'train_r_p_mean_file': r_train['r_p_mean_file'],
+                 'train_rmse_map_mean_file': r_train['rmse_map_mean_file'],
+                 **r_val}
+            
+            # Scheduler update    ---------------------------------------------
+            scheduler.step(loss)
+            earl_stp = earlyStp.step(r)            
+
+            # Print    --------------------------------------------------------
+            ep_runtime = time.time() - tic_epoch
+            print(
+                'ep {} sec {:0.0f} es {} lr {:0.0e} loss {:0.4f} // '
+                'r_p_tr {:0.2f} rmse_map_tr {:0.2f} // r_p {:0.2f} rmse_map {:0.2f} // '
+                'best_r_p {:0.2f} best_rmse_map {:0.2f},'
+                .format(epoch+1, ep_runtime, earlyStp.cnt, NL.get_lr(opt), loss, 
+                        r['train_r_p_mean_file'], r['train_rmse_map_mean_file'],
+                        r['r_p_mean_file'], r['rmse_map_mean_file'],
+                        earlyStp.best_r_p, earlyStp.best_rmse))
+
+            # Save results and model  -----------------------------------------
+            self._saveResults(self.model, self.model_args, opt, epoch, loss, ep_runtime, r, db_results, earlyStp.best)
+
+            # Early stopping    -----------------------------------------------
+            if earl_stp:
+                print('--> Early stopping. best_r_p {:0.2f} best_rmse {:0.2f}'
+                    .format(earlyStp.best_r_p, earlyStp.best_rmse))
+                return        
+
+        # Training done --------------------------------------------------------
+        print('--> Training done. best_r_p {:0.2f} best_rmse_map {:0.2f}'
+                            .format(earlyStp.best_r_p, earlyStp.best_rmse))        
+        return    
 
     def _train_mos(self):
         '''
@@ -922,6 +1114,23 @@ class nisqaModel(object):
             filename_column_ref = self.args['csv_ref'],                        
             )
 
+        self.ds_semi = NL.SemiDataset(
+            self.semi_data_path,
+            seg_length = self.args['ms_seg_length'],
+            max_length = self.args['ms_max_segments'],
+            to_memory = self.args['tr_ds_to_memory'],
+            to_memory_workers = self.args['tr_ds_to_memory_workers'],
+            seg_hop_length = self.args['ms_seg_hop_length'],
+            transform = None,
+            ms_n_fft = self.args['ms_n_fft'],
+            ms_hop_length = self.args['ms_hop_length'],
+            ms_win_length = self.args['ms_win_length'],
+            ms_n_mels = self.args['ms_n_mels'],
+            ms_sr = self.args['ms_sr'],
+            ms_fmax = self.args['ms_fmax'],
+            ms_channel = self.args['ms_channel']
+            )
+        
         self.runinfos['ds_train_len'] = len(self.ds_train)
         self.runinfos['ds_val_len'] = len(self.ds_val)
     
