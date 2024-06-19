@@ -24,6 +24,8 @@ from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 
+import json
+from natsort import natsorted
 
 #%% Models
 class NISQA(nn.Module):
@@ -1430,8 +1432,8 @@ def predict_mos(model, ds, bs, dev, num_workers=0):
                     num_workers=num_workers)
     model.to(dev)
     model.eval()
-    with torch.no_grad():
-        y_hat_list = [ [model(xb.to(dev), n_wins.to(dev)).cpu().numpy(), yb.cpu().numpy()] for xb, yb, (idx, n_wins) in dl]
+    with torch.inference_mode():
+        y_hat_list = [ [model(xb.to(dev), n_wins.to(dev)).cpu().numpy(), yb.cpu().numpy()] for xb, yb, (idx, n_wins) in tqdm(dl)]
     yy = np.concatenate( y_hat_list, axis=1 )
     y_hat = yy[0,:,0].reshape(-1,1)
     y = yy[1,:,0].reshape(-1,1)
@@ -1451,8 +1453,8 @@ def predict_dim(model, ds, bs, dev, num_workers=0):
                     num_workers=num_workers)
     model.to(dev)
     model.eval()
-    with torch.no_grad():
-        y_hat_list = [ [model(xb.to(dev), n_wins.to(dev)).cpu().numpy(), yb.cpu().numpy()] for xb, yb, (idx, n_wins) in dl]
+    with torch.inference_mode():
+        y_hat_list = [ [model(xb.to(dev), n_wins.to(dev)).cpu().numpy(), yb.cpu().numpy()] for xb, yb, (idx, n_wins) in tqdm(dl)]
     yy = np.concatenate( y_hat_list, axis=1 )
     
     y_hat = yy[0,:,:]
@@ -1652,7 +1654,7 @@ def calc_mapping(
     '''       
     if dcon_db is not None:
         y = dcon_db[target_mos].to_numpy()        
-        y_hat = dfile_db.groupby('con').mean().get(pred).to_numpy()
+        y_hat = dfile_db.groupby('con')[pred].mean().to_numpy()
     else:
         y = dfile_db[target_mos].to_numpy()        
         y_hat = dfile_db[pred].to_numpy()    
@@ -1737,7 +1739,7 @@ def eval_results(
         if (dcon_db is not None) and ('con' in df_db):
             
             y_con = dcon_db[target_mos].to_numpy()
-            y_con_hat = df_db.groupby('con').mean().get(pred).to_numpy()
+            y_con_hat = df_db.groupby('con')[pred].mean().to_numpy()
 
             if not np.isnan(y_con).any():
                 
@@ -1758,7 +1760,7 @@ def eval_results(
                 df_db['y_hat_map'] = calc_mapped(y_hat, b_con)  
                 df['y_hat_map'].loc[df.db==db_name] = df_db['y_hat_map'] 
                 
-                y_con_hat_map = df_db.groupby('con').mean().get('y_hat_map').to_numpy()
+                y_con_hat_map = df_db.groupby('con')['y_hat_map'].mean().to_numpy()
                 r_con = calc_eval_metrics(y_con, y_con_hat, y_hat_map=y_con_hat_map, d=d, ci=ci_con)
                 
         r_con = {f'{k}_con': v for k, v in r_con.items()}
@@ -2326,4 +2328,160 @@ def get_librosa_melspec(
     return spec
 
 
+class SemiDataset(Dataset):
+    '''
+    Dataset for Speech Enhancement - semi data.
+    '''  
+    def __init__(
+        self,
+        data_dir,
+        seg_length=15,
+        max_length=None,
+        to_memory=False,
+        to_memory_workers=0,
+        transform=None,
+        seg_hop_length=1,
+        ms_n_fft = 1024,
+        ms_hop_length = 80,
+        ms_win_length = 170,
+        ms_n_mels=32,
+        ms_sr=48e3,
+        ms_fmax=16e3,
+        ms_channel=None,
+        ):
 
+        self.data_dir = data_dir
+        self.seg_length = seg_length
+        self.max_length = max_length
+        self.to_memory = to_memory
+        self.to_memory_workers = to_memory_workers
+        self.transform = transform
+        self.seg_hop_length = seg_hop_length
+        self.ms_n_fft = ms_n_fft
+        self.ms_hop_length = ms_hop_length
+        self.ms_win_length = ms_win_length
+        self.ms_n_mels = ms_n_mels
+        self.ms_sr = ms_sr
+        self.ms_fmax = ms_fmax
+        self.ms_channel = ms_channel
+
+        self.clean_dir = os.path.join(data_dir, "clean")
+        self.noisy_dir = os.path.join(data_dir, "noisy")
+        self.enhanced_dir = os.path.join(data_dir, "enhanced")
+
+        self.enhanced_wav_name = os.listdir(self.enhanced_dir)
+        self.enhanced_wav_name = natsorted(self.enhanced_wav_name)
+
+        with open(f'{self.data_dir}/clean_score.json', 'r') as file:
+            self.clean_score = json.load(file)
+
+        with open(f'{self.data_dir}/noisy_score.json', 'r') as file:
+            self.noisy_score = json.load(file)
+
+        with open(f'{self.data_dir}/enhanced_score.json', 'r') as file:
+            self.enhanced_score = json.load(file)
+
+    def _load_spec(self, index):
+        
+        # Load spec    
+        clean_file = os.path.join(self.clean_dir, self.enhanced_wav_name[index])
+        noisy_file = os.path.join(self.noisy_dir, self.enhanced_wav_name[index])
+        enhanced_file = os.path.join(self.enhanced_dir, self.enhanced_wav_name[index])
+    
+        spec_clean = get_librosa_melspec(
+            clean_file,
+            sr = self.ms_sr,
+            n_fft=self.ms_n_fft,
+            hop_length=self.ms_hop_length,
+            win_length=self.ms_win_length,
+            n_mels=self.ms_n_mels,
+            fmax=self.ms_fmax,
+            ms_channel=self.ms_channel
+            )   
+
+        spec_noisy = get_librosa_melspec(
+            noisy_file,
+            sr = self.ms_sr,
+            n_fft=self.ms_n_fft,
+            hop_length=self.ms_hop_length,
+            win_length=self.ms_win_length,
+            n_mels=self.ms_n_mels,
+            fmax=self.ms_fmax,
+            ms_channel=self.ms_channel
+            )
+
+        spec_enhanced = get_librosa_melspec(
+            enhanced_file,
+            sr = self.ms_sr,
+            n_fft=self.ms_n_fft,
+            hop_length=self.ms_hop_length,
+            win_length=self.ms_win_length,
+            n_mels=self.ms_n_mels,
+            fmax=self.ms_fmax,
+            ms_channel=self.ms_channel
+            )
+                
+        return [spec_clean, spec_noisy, spec_enhanced]
+            
+    def __getitem__(self, index):
+        assert isinstance(index, int), 'index must be integer (no slice)'
+
+        spec_clean, spec_noisy, spec_enhanced  = self._load_spec(index)
+
+        clean_score = self.clean_score[self.enhanced_wav_name[index]]
+        noisy_score = self.noisy_score[self.enhanced_wav_name[index]]
+        enhanced_score = self.enhanced_score[self.enhanced_wav_name[index]]
+                    
+        # Segment specs
+        file_path = " "
+
+        if self.seg_length is not None:
+            x_spec_seg_clean, n_wins_clean = segment_specs(file_path, # function not use file_path
+                spec_clean,
+                self.seg_length,
+                self.seg_hop_length,
+                self.max_length)
+
+            x_spec_seg_noisy, n_wins_noisy = segment_specs(file_path, # function not use file_path
+                spec_noisy,
+                self.seg_length,
+                self.seg_hop_length,
+                self.max_length)
+
+            x_spec_seg_enhanced, n_wins_enhanced = segment_specs(file_path, # function not use file_path
+                spec_enhanced,
+                self.seg_length,
+                self.seg_hop_length,
+                self.max_length)
+        else:
+            x_spec_seg_clean = spec_clean
+            n_wins_clean = spec_clean.shape[1]
+            if self.max_length is not None:
+                x_padded = np.zeros((x_spec_seg_clean.shape[0], self.max_length))
+                x_padded[:,:n_wins_clean] = x_spec_seg_clean
+                x_spec_seg_clean = np.expand_dims(x_padded.transpose(1,0), axis=(1, 3))      
+                if not torch.is_tensor(x_spec_seg_clean):
+                    x_spec_seg_clean = torch.tensor(x_spec_seg_clean, dtype=torch.float)                  
+            
+            x_spec_seg_noisy = spec_noisy
+            n_wins_noisy = spec_noisy.shape[1]      
+            if self.max_length is not None:
+                x_padded = np.zeros((x_spec_seg_noisy.shape[0], self.max_length))
+                x_padded[:,:n_wins_noisy] = x_spec_seg_noisy
+                x_spec_seg_noisy = np.expand_dims(x_padded.transpose(1,0), axis=(1, 3))                     
+                if not torch.is_tensor(x_spec_seg_noisy):
+                    x_spec_seg_noisy = torch.tensor(x_spec_seg_noisy, dtype=torch.float)
+
+            x_spec_seg_enhanced = spec_enhanced
+            n_wins_enhanced = spec_enhanced.shape[1]      
+            if self.max_length is not None:
+                x_padded = np.zeros((x_spec_seg_enhanced.shape[0], self.max_length))
+                x_padded[:,:n_wins_enhanced] = x_spec_seg_enhanced
+                x_spec_seg_enhanced = np.expand_dims(x_padded.transpose(1,0), axis=(1, 3))                     
+                if not torch.is_tensor(x_spec_seg_enhanced):
+                    x_spec_seg_enhanced = torch.tensor(x_spec_seg_enhanced, dtype=torch.float)            
+                
+        return [x_spec_seg_clean, x_spec_seg_noisy, x_spec_seg_enhanced], [clean_score, noisy_score, enhanced_score], [n_wins_clean, n_wins_noisy, n_wins_enhanced]
+
+    def __len__(self):
+        return len(self.enhanced_wav_name)
